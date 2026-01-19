@@ -1473,7 +1473,7 @@ You can verify the script's read-only nature by:
 
 ## Version History
 
-### Version 2.0 (Current)
+### Version 2.0 (Current) (https://aws.amazon.com/blogs/migration-and-modernization/accelerating-vmware-cloud-migration-with-aws-transform-and-powercli/)
 - Added P95 percentile calculations for realistic peak values
 - Implemented secure credential management
 - Comprehensive error handling
