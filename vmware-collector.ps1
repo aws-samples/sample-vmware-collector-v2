@@ -1007,6 +1007,7 @@ $vcenterVersion = $global:DefaultVIServer.Version + " Build " + $global:DefaultV
 Write-DebugLog "Retrieving vCenter stat intervals..."
 $statIntervals = Get-StatInterval
 $statIntervalsHash = @{}
+$statRetentionHash = @{}  # Store retention times in seconds
 
 if (-not $statIntervals) {
     Write-DebugLog "Warning: Could not retrieve stat intervals, using defaults"
@@ -1016,6 +1017,12 @@ if (-not $statIntervals) {
         pastMonth = 7200   # 2 hours
         pastYear = 86400   # 1 day
     }
+    $statRetentionHash = @{
+        pastDay = 86400       # 1 day retention
+        pastWeek = 604800     # 7 days retention
+        pastMonth = 2592000   # 30 days retention
+        pastYear = 31536000   # 365 days retention
+    }
 } else {
     $statIntervalsHash = @{
         pastDay = ($statIntervals | Where-Object { $_.Name -eq "Past Day" }).SamplingPeriodSecs
@@ -1023,6 +1030,13 @@ if (-not $statIntervals) {
         pastMonth = ($statIntervals | Where-Object { $_.Name -eq "Past Month" }).SamplingPeriodSecs
         pastYear = ($statIntervals | Where-Object { $_.Name -eq "Past Year" }).SamplingPeriodSecs
     }
+    $statRetentionHash = @{
+        pastDay = ($statIntervals | Where-Object { $_.Name -eq "Past Day" }).StorageTimeSecs
+        pastWeek = ($statIntervals | Where-Object { $_.Name -eq "Past Week" }).StorageTimeSecs
+        pastMonth = ($statIntervals | Where-Object { $_.Name -eq "Past Month" }).StorageTimeSecs
+        pastYear = ($statIntervals | Where-Object { $_.Name -eq "Past Year" }).StorageTimeSecs
+    }
+    Write-DebugLog "Stat intervals - PastDay: $($statIntervalsHash.pastDay)s (retention: $($statRetentionHash.pastDay)s), PastWeek: $($statIntervalsHash.pastWeek)s (retention: $($statRetentionHash.pastWeek)s)"
 }
 
 Write-Host "Connected to vCenter: $($global:DefaultVIServer.Name)" -ForegroundColor Green
@@ -1670,156 +1684,223 @@ function Get-VMNetworkDetails {
 # OPTIMIZATION 4: Bulk Performance Data Collection (if enabled)
 if (-not $skipPerformanceData) {
     Write-Host "`nCollecting bulk performance data..." -ForegroundColor Cyan
-    Write-Host "  This collects $collectionDays days of CPU and Memory statistics for all $totalVMs VMs in one operation" -ForegroundColor Yellow
+    Write-Host "  This collects $collectionDays days of CPU and Memory statistics for all $totalVMs VMs" -ForegroundColor Yellow
     
     try {
         $bulkPerfStartTime = Get-Date
-        $startDate = (Get-Date).AddDays(-$collectionDays)
         $endDate = Get-Date
+        $collectionSeconds = $collectionDays * 86400  # Convert days to seconds
         
-        # Determine appropriate stat interval based on collection period
-        $intervalSec = $statIntervalsHash.pastDay  # Default to 5-minute intervals
-        if ($collectionDays -le 2) {
-            $intervalSec = $statIntervalsHash.pastDay      # 5 minutes for up to 2 days
-        } elseif ($collectionDays -gt 2 -and $collectionDays -le 7) {
-            $intervalSec = $statIntervalsHash.pastWeek     # 30 minutes from day 2 to day 7
-        } elseif ($collectionDays -gt 7 -and $collectionDays -le 30) {
-            $intervalSec = $statIntervalsHash.pastMonth    # 2 hours from day 7 to day 30
-        } else {
-            $intervalSec = $statIntervalsHash.pastYear     # 1 day for 30+ days up to 365 days
+        # ============================================================================
+        # TIERED COLLECTION STRATEGY (Dynamic based on vCenter configuration)
+        # ============================================================================
+        # VMware returns uniform granularity per query based on the oldest timestamp.
+        # To maximize data quality, we make separate API calls for each retention tier.
+        # Tier boundaries are determined by the actual vCenter stat retention settings.
+        # ============================================================================
+        
+        # Calculate tier boundaries based on actual vCenter retention settings
+        $tier1RetentionSecs = $statRetentionHash.pastDay    # e.g., 86400 (1 day)
+        $tier2RetentionSecs = $statRetentionHash.pastWeek   # e.g., 604800 (7 days)
+        $tier3RetentionSecs = $statRetentionHash.pastMonth  # e.g., 2592000 (30 days)
+        $tier4RetentionSecs = $statRetentionHash.pastYear   # e.g., 31536000 (365 days)
+        
+        # Convert retention to days for easier calculation
+        $tier1RetentionDays = [Math]::Floor($tier1RetentionSecs / 86400)  # e.g., 1 day
+        $tier2RetentionDays = [Math]::Floor($tier2RetentionSecs / 86400)  # e.g., 7 days
+        $tier3RetentionDays = [Math]::Floor($tier3RetentionSecs / 86400)  # e.g., 30 days
+        $tier4RetentionDays = [Math]::Floor($tier4RetentionSecs / 86400)  # e.g., 365 days
+        
+        # Calculate samples per day for each tier based on actual intervals
+        $tier1SamplesPerDay = if ($statIntervalsHash.pastDay -gt 0) { [Math]::Floor(86400 / $statIntervalsHash.pastDay) } else { 288 }
+        $tier2SamplesPerDay = if ($statIntervalsHash.pastWeek -gt 0) { [Math]::Floor(86400 / $statIntervalsHash.pastWeek) } else { 48 }
+        $tier3SamplesPerDay = if ($statIntervalsHash.pastMonth -gt 0) { [Math]::Floor(86400 / $statIntervalsHash.pastMonth) } else { 12 }
+        $tier4SamplesPerDay = if ($statIntervalsHash.pastYear -gt 0) { [Math]::Floor(86400 / $statIntervalsHash.pastYear) } else { 1 }
+        
+        Write-DebugLog "vCenter stat retention: Tier1=${tier1RetentionDays}d, Tier2=${tier2RetentionDays}d | Samples/day: Tier1=$tier1SamplesPerDay, Tier2=$tier2SamplesPerDay"
+        
+        # Define collection tiers based on vCenter's actual stat retention boundaries
+        $collectionTiers = @()
+        $remainingDays = $collectionDays
+        $currentEnd = $endDate
+        
+        # Tier 1: Finest granularity (e.g., 5-min intervals for past day)
+        if ($remainingDays -gt 0 -and $tier1RetentionDays -gt 0) {
+            $tier1Days = [Math]::Min($remainingDays, $tier1RetentionDays)
+            $tier1Start = $currentEnd.AddDays(-$tier1Days)
+            $collectionTiers += @{
+                Name = "Last $tier1Days day(s) ($($statIntervalsHash.pastDay)s intervals)"
+                Start = $tier1Start
+                End = $currentEnd
+                IntervalSecs = $statIntervalsHash.pastDay
+                ExpectedSamples = $tier1Days * $tier1SamplesPerDay
+            }
+            $remainingDays -= $tier1Days
+            $currentEnd = $tier1Start
         }
         
-        Write-DebugLog "Using interval: $intervalSec seconds for $collectionDays days collection"
-        Write-DebugLog "Date range: $startDate to $endDate"
-        
-        # Calculate expected data points based on collection period and VMware stat intervals
-        $expectedSamples = 0
-        if ($collectionDays -le 2) {
-            # 5-minute intervals for up to 2 days
-            $expectedSamples = $collectionDays * 288  # 288 samples per day at 5-min intervals
-        } elseif ($collectionDays -le 7) {
-            # Mixed: 2 days at 5-min + remaining days at 30-min
-            $expectedSamples = (2 * 288) + (($collectionDays - 2) * 48)  # 48 samples per day at 30-min intervals
-        } elseif ($collectionDays -le 30) {
-            # Mixed: 2 days at 5-min + 5 days at 30-min + remaining days at 2-hour
-            $expectedSamples = (2 * 288) + (5 * 48) + (($collectionDays - 7) * 12)  # 12 samples per day at 2-hour intervals
-        } else {
-            # Mixed: 2 days at 5-min + 5 days at 30-min + 23 days at 2-hour + remaining days at 1-day
-            $expectedSamples = (2 * 288) + (5 * 48) + (23 * 12) + ($collectionDays - 30)  # 1 sample per day
+        # Tier 2: Medium granularity (e.g., 30-min intervals for past week)
+        if ($remainingDays -gt 0 -and $tier2RetentionDays -gt $tier1RetentionDays) {
+            $tier2MaxDays = $tier2RetentionDays - $tier1RetentionDays
+            $tier2Days = [Math]::Min($remainingDays, $tier2MaxDays)
+            if ($tier2Days -gt 0) {
+                $tier2Start = $currentEnd.AddDays(-$tier2Days)
+                $collectionTiers += @{
+                    Name = "Days $($collectionDays - $remainingDays + 1)-$($collectionDays - $remainingDays + $tier2Days) ($($statIntervalsHash.pastWeek)s intervals)"
+                    Start = $tier2Start
+                    End = $currentEnd
+                    IntervalSecs = $statIntervalsHash.pastWeek
+                    ExpectedSamples = $tier2Days * $tier2SamplesPerDay
+                }
+                $remainingDays -= $tier2Days
+                $currentEnd = $tier2Start
+            }
         }
         
-        # Add 20% buffer for safety and use as MaxSamples
-        $maxSamples = [math]::Ceiling($expectedSamples * 1.2)
+        # Tier 3: Coarse granularity (e.g., 2-hour intervals for past month)
+        if ($remainingDays -gt 0 -and $tier3RetentionDays -gt $tier2RetentionDays) {
+            $tier3MaxDays = $tier3RetentionDays - $tier2RetentionDays
+            $tier3Days = [Math]::Min($remainingDays, $tier3MaxDays)
+            if ($tier3Days -gt 0) {
+                $tier3Start = $currentEnd.AddDays(-$tier3Days)
+                $collectionTiers += @{
+                    Name = "Days $($collectionDays - $remainingDays + 1)-$($collectionDays - $remainingDays + $tier3Days) ($($statIntervalsHash.pastMonth)s intervals)"
+                    Start = $tier3Start
+                    End = $currentEnd
+                    IntervalSecs = $statIntervalsHash.pastMonth
+                    ExpectedSamples = $tier3Days * $tier3SamplesPerDay
+                }
+                $remainingDays -= $tier3Days
+                $currentEnd = $tier3Start
+            }
+        }
         
-        Write-DebugLog "Expected ~$expectedSamples samples per VM, using MaxSamples: $maxSamples"
-        Write-DebugLog "Processing $($vms.Count) VMs"
-        Write-DebugLog "Date range: $startDate to $endDate"
-        Write-DebugLog "Interval: $intervalSec seconds"
+        # Tier 4: Coarsest granularity (e.g., 1-day intervals for past year)
+        if ($remainingDays -gt 0 -and $tier4RetentionDays -gt $tier3RetentionDays) {
+            $tier4Days = [Math]::Min($remainingDays, $tier4RetentionDays - $tier3RetentionDays)
+            if ($tier4Days -gt 0) {
+                $tier4Start = $currentEnd.AddDays(-$tier4Days)
+                $collectionTiers += @{
+                    Name = "Days $($collectionDays - $remainingDays + 1)-$($collectionDays - $remainingDays + $tier4Days) ($($statIntervalsHash.pastYear)s intervals)"
+                    Start = $tier4Start
+                    End = $currentEnd
+                    IntervalSecs = $statIntervalsHash.pastYear
+                    ExpectedSamples = $tier4Days * $tier4SamplesPerDay
+                }
+            }
+        }
         
-        Write-DebugLog "Collecting CPU statistics for all VMs..."
+        # Calculate total expected samples
+        $totalExpectedSamples = ($collectionTiers | ForEach-Object { $_.ExpectedSamples } | Measure-Object -Sum).Sum
         
-        # Try smaller batches to avoid hanging and improve reliability
+        Write-Host "  Using tiered collection for optimal data granularity ($($collectionTiers.Count) tiers, ~$totalExpectedSamples samples/VM)" -ForegroundColor Cyan
+        Write-DebugLog "Tiered collection: $($collectionTiers.Count) tiers, ~$totalExpectedSamples samples/VM expected"
+        
+        # ============================================================================
+        # COLLECT CPU STATISTICS (all tiers)
+        # ============================================================================
+        
         $allCpuStats = @()
         $batchSize = 10  # Process 10 VMs at a time
         $totalBatches = [Math]::Ceiling($vms.Count / $batchSize)
-        $cpuBatchStartTime = Get-Date
+        $tierNum = 0
         
-        for ($i = 0; $i -lt $vms.Count; $i += $batchSize) {
-            $batch = $vms[$i..([Math]::Min($i + $batchSize - 1, $vms.Count - 1))]
-            $batchNum = [Math]::Floor($i / $batchSize) + 1
+        foreach ($tier in $collectionTiers) {
+            $tierNum++
             
-            # Calculate progress and ETA
-            $percentComplete = [math]::Round(($batchNum / $totalBatches) * 100, 1)
-            $elapsedTime = (Get-Date) - $cpuBatchStartTime
-            if ($batchNum -gt 1) {
-                $avgTimePerBatch = $elapsedTime.TotalSeconds / ($batchNum - 1)
-                $remainingBatches = $totalBatches - $batchNum
-                $etaSeconds = $avgTimePerBatch * $remainingBatches
-                $etaTimeSpan = [TimeSpan]::FromSeconds($etaSeconds)
-                $etaFormatted = if ($etaTimeSpan.TotalHours -ge 1) {
-                    "{0:hh\:mm\:ss}" -f $etaTimeSpan
+            $tierCpuStats = @()
+            $cpuBatchStartTime = Get-Date
+            $maxSamples = [math]::Ceiling($tier.ExpectedSamples * 1.2)  # 20% buffer
+            
+            for ($i = 0; $i -lt $vms.Count; $i += $batchSize) {
+                $batch = $vms[$i..([Math]::Min($i + $batchSize - 1, $vms.Count - 1))]
+                $batchNum = [Math]::Floor($i / $batchSize) + 1
+                
+                # Calculate progress and ETA
+                $percentComplete = [math]::Round(($batchNum / $totalBatches) * 100, 1)
+                $elapsedTime = (Get-Date) - $cpuBatchStartTime
+                if ($batchNum -gt 1) {
+                    $avgTimePerBatch = $elapsedTime.TotalSeconds / ($batchNum - 1)
+                    $remainingBatches = $totalBatches - $batchNum
+                    $etaSeconds = $avgTimePerBatch * $remainingBatches
+                    $etaTimeSpan = [TimeSpan]::FromSeconds($etaSeconds)
+                    $etaFormatted = if ($etaTimeSpan.TotalHours -ge 1) {
+                        "{0:hh\:mm\:ss}" -f $etaTimeSpan
+                    } else {
+                        "{0:mm\:ss}" -f $etaTimeSpan
+                    }
+                    Write-Progress -Activity "Collecting CPU Statistics" -Status "Tier $tierNum/$($collectionTiers.Count) - Batch $batchNum/$totalBatches ($percentComplete%) - ETA: $etaFormatted" -PercentComplete $percentComplete
                 } else {
-                    "{0:mm\:ss}" -f $etaTimeSpan
+                    Write-Progress -Activity "Collecting CPU Statistics" -Status "Tier $tierNum/$($collectionTiers.Count) - Batch $batchNum/$totalBatches ($percentComplete%)" -PercentComplete $percentComplete
                 }
-                Write-Progress -Activity "Collecting CPU Statistics" -Status "Batch $batchNum of $totalBatches ($percentComplete%) - ETA: $etaFormatted" -PercentComplete $percentComplete
-            } else {
-                Write-Progress -Activity "Collecting CPU Statistics" -Status "Batch $batchNum of $totalBatches ($percentComplete%) - Calculating ETA..." -PercentComplete $percentComplete
+                
+                try {
+                    $batchStats = Get-Stat -Entity $batch -Start $tier.Start -Finish $tier.End -Stat cpu.usage.average -IntervalSecs $tier.IntervalSecs -MaxSamples $maxSamples -ErrorAction SilentlyContinue
+                    if ($batchStats) {
+                        $tierCpuStats += $batchStats
+                    }
+                } catch {
+                    Write-DebugLog "CPU Tier $tierNum Batch ${batchNum} failed: $($_.Exception.Message)"
+            }
             }
             
-            Write-DebugLog "Processing CPU batch $batchNum of $totalBatches ($($batch.Count) VMs)..."
-            
-            try {
-                $batchStats = Get-Stat -Entity $batch -Start $startDate -Finish $endDate -Stat cpu.usage.average -IntervalSecs $intervalSec -MaxSamples $maxSamples -ErrorAction SilentlyContinue
-                if ($batchStats) {
-                    $allCpuStats += $batchStats
-                    Write-DebugLog "Batch ${batchNum}: Retrieved $($batchStats.Count) CPU data points"
-                } else {
-                    Write-DebugLog "Batch ${batchNum}: No CPU data returned"
-                }
-            } catch {
-                Write-DebugLog "Batch ${batchNum} failed: $($_.Exception.Message)"
-            }
+            $allCpuStats += $tierCpuStats
         }
         
         Write-Progress -Activity "Collecting CPU Statistics" -Completed
-        Write-DebugLog "Retrieved $($allCpuStats.Count) CPU data points"
         
-        if ($allCpuStats.Count -eq 0) {
-            Write-DebugLog "WARNING: No CPU stats returned! Possible causes: VMs powered off, low statistics level, no historical data, or date range outside available data"
-        }
+        # ============================================================================
+        # COLLECT MEMORY STATISTICS (all tiers)
+        # ============================================================================
         
-        Write-DebugLog "Collecting Memory statistics for all VMs..."
-        
-        # Process memory stats in batches (same approach as CPU)
         $allMemStats = @()
-        $memBatchStartTime = Get-Date
+        $tierNum = 0
         
-        for ($i = 0; $i -lt $vms.Count; $i += $batchSize) {
-            $batch = $vms[$i..([Math]::Min($i + $batchSize - 1, $vms.Count - 1))]
-            $batchNum = [Math]::Floor($i / $batchSize) + 1
+        foreach ($tier in $collectionTiers) {
+            $tierNum++
             
-            # Calculate progress and ETA
-            $percentComplete = [math]::Round(($batchNum / $totalBatches) * 100, 1)
-            $elapsedTime = (Get-Date) - $memBatchStartTime
-            if ($batchNum -gt 1) {
-                $avgTimePerBatch = $elapsedTime.TotalSeconds / ($batchNum - 1)
-                $remainingBatches = $totalBatches - $batchNum
-                $etaSeconds = $avgTimePerBatch * $remainingBatches
-                $etaTimeSpan = [TimeSpan]::FromSeconds($etaSeconds)
-                $etaFormatted = if ($etaTimeSpan.TotalHours -ge 1) {
-                    "{0:hh\:mm\:ss}" -f $etaTimeSpan
+            $tierMemStats = @()
+            $memBatchStartTime = Get-Date
+            $maxSamples = [math]::Ceiling($tier.ExpectedSamples * 1.2)
+            
+            for ($i = 0; $i -lt $vms.Count; $i += $batchSize) {
+                $batch = $vms[$i..([Math]::Min($i + $batchSize - 1, $vms.Count - 1))]
+                $batchNum = [Math]::Floor($i / $batchSize) + 1
+                
+                # Calculate progress and ETA
+                $percentComplete = [math]::Round(($batchNum / $totalBatches) * 100, 1)
+                $elapsedTime = (Get-Date) - $memBatchStartTime
+                if ($batchNum -gt 1) {
+                    $avgTimePerBatch = $elapsedTime.TotalSeconds / ($batchNum - 1)
+                    $remainingBatches = $totalBatches - $batchNum
+                    $etaSeconds = $avgTimePerBatch * $remainingBatches
+                    $etaTimeSpan = [TimeSpan]::FromSeconds($etaSeconds)
+                    $etaFormatted = if ($etaTimeSpan.TotalHours -ge 1) {
+                        "{0:hh\:mm\:ss}" -f $etaTimeSpan
+                    } else {
+                        "{0:mm\:ss}" -f $etaTimeSpan
+                    }
+                    Write-Progress -Activity "Collecting Memory Statistics" -Status "Tier $tierNum/$($collectionTiers.Count) - Batch $batchNum/$totalBatches ($percentComplete%) - ETA: $etaFormatted" -PercentComplete $percentComplete
                 } else {
-                    "{0:mm\:ss}" -f $etaTimeSpan
+                    Write-Progress -Activity "Collecting Memory Statistics" -Status "Tier $tierNum/$($collectionTiers.Count) - Batch $batchNum/$totalBatches ($percentComplete%)" -PercentComplete $percentComplete
                 }
-                Write-Progress -Activity "Collecting Memory Statistics" -Status "Batch $batchNum of $totalBatches ($percentComplete%) - ETA: $etaFormatted" -PercentComplete $percentComplete
-            } else {
-                Write-Progress -Activity "Collecting Memory Statistics" -Status "Batch $batchNum of $totalBatches ($percentComplete%) - Calculating ETA..." -PercentComplete $percentComplete
+                
+                try {
+                    $batchMemStats = Get-Stat -Entity $batch -Start $tier.Start -Finish $tier.End -Stat mem.consumed.average -IntervalSecs $tier.IntervalSecs -MaxSamples $maxSamples -ErrorAction SilentlyContinue
+                    if ($batchMemStats) {
+                        $tierMemStats += $batchMemStats
+                    }
+                } catch {
+                    Write-DebugLog "Memory Tier $tierNum Batch ${batchNum} failed: $($_.Exception.Message)"
+            }
             }
             
-            Write-DebugLog "Processing Memory batch $batchNum of $totalBatches ($($batch.Count) VMs)..."
-            
-            try {
-                $batchMemStats = Get-Stat -Entity $batch -Start $startDate -Finish $endDate -Stat mem.consumed.average -IntervalSecs $intervalSec -MaxSamples $maxSamples -ErrorAction SilentlyContinue
-                if ($batchMemStats) {
-                    $allMemStats += $batchMemStats
-                    Write-DebugLog "Batch ${batchNum}: Retrieved $($batchMemStats.Count) Memory data points"
-                } else {
-                    Write-DebugLog "Batch ${batchNum}: No Memory data returned"
-                }
-            } catch {
-                Write-DebugLog "Memory batch ${batchNum} failed: $($_.Exception.Message)"
-            }
+            $allMemStats += $tierMemStats
         }
         
         Write-Progress -Activity "Collecting Memory Statistics" -Completed
-        Write-DebugLog "Retrieved $($allMemStats.Count) Memory data points"
-        
-        if ($allMemStats.Count -eq 0) {
-            Write-DebugLog "WARNING: No Memory stats returned!"
-        }
         
         # Process bulk stats into per-VM data
-        Write-DebugLog "Processing bulk statistics..."
         $global:BulkPerfData = @{}
         
         foreach ($vm in $vms) {
@@ -1854,14 +1935,10 @@ if (-not $skipPerformanceData) {
         $bulkPerfTime = (Get-Date) - $bulkPerfStartTime
         $vmsWithData = ($global:BulkPerfData.Values | Where-Object { $_.dataPoints -gt 0 }).Count
         $totalDataPoints = ($global:BulkPerfData.Values | ForEach-Object { $_.dataPoints } | Measure-Object -Sum).Sum
-        Write-Host "`nBulk performance collection completed!" -ForegroundColor Green
-        Write-Host "  Time: $($bulkPerfTime.TotalSeconds.ToString('F1')) seconds" -ForegroundColor Cyan
-        Write-Host "  VMs with data: $vmsWithData of $totalVMs" -ForegroundColor Cyan
-        Write-Host "  Total data points: $totalDataPoints (CPU + Memory metrics)" -ForegroundColor Cyan
-        Write-Host "  Data is now cached in memory for VM processing phase" -ForegroundColor Yellow
-        Write-DebugLog "Successfully collected performance data for $vmsWithData of $totalVMs VMs"
+        Write-Host "`nPerformance collection completed in $($bulkPerfTime.TotalSeconds.ToString('F1'))s - $vmsWithData/$totalVMs VMs, $totalDataPoints data points" -ForegroundColor Green
+        Write-DebugLog "Performance data collected: $vmsWithData/$totalVMs VMs, $totalDataPoints points"
         if ($vmsWithData -eq 0) {
-            Write-DebugLog "WARNING: No performance data was collected! Check if VMs are powered on and have historical stats."
+            Write-Host "  WARNING: No performance data collected. Check if VMs are powered on." -ForegroundColor Yellow
         }
         
     } catch {
