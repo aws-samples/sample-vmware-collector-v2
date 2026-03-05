@@ -588,7 +588,7 @@ Detects SQL Server editions for licensing:
 
 **Example:**
 ```
-VM: WebServer01 (4 vCPU)
+VM: WebServer01 (8 vCPU)
 Samples: 2,016 (7 days × 288 samples/day)
 Values: [15%, 23%, 45%, ..., 85%, 98%]
 
